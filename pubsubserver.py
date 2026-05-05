@@ -1,8 +1,32 @@
-from socket import *
 import sys
-import re
+import socket
 import threading
-from sys import stdout,stdin,argv,exit
+import re
+
+MSG_HANDSHAKE_CLIENT  = b'\x01'
+MSG_HANDSHAKE_OK      = b'\x02'
+MSG_HANDSHAKE_DUP     = b'\x03'
+MSG_PUBLISH           = b'\x04'
+MSG_SUBSCRIBE         = b'\x05'
+MSG_UNSUBSCRIBE       = b'\x06'
+MSG_INCOMING          = b'\x07'
+MSG_RATE_LIMIT        = b'\x08'
+MSG_SERVER_QUIT       = b'\x09'
+MSG_SENDFILE          = b'\x0A'
+MSG_INCOMING_FILE     = b'\x0B'
+
+# Server-to-server only messages
+MSG_SRV_HANDSHAKE     = b'\x20'   # peer intro: magic + server_id + known_server_ids
+MSG_SRV_HANDSHAKE_OK  = b'\x21'
+MSG_SRV_HANDSHAKE_DUP = b'\x22'   # duplicate server ID in federation
+MSG_SRV_HANDSHAKE_SELF= b'\x23'   # connected to self
+MSG_SRV_QUIT          = b'\x24'   # server shutting down
+MSG_SRV_PUBLISH       = b'\x25'   # federated publish (text)
+MSG_SRV_PUBLISH_FILE  = b'\x26'   # federated publish (file)
+MSG_SRV_CLIENT_JOINED = b'\x27'   # inform peers a new client joined
+MSG_SRV_CLIENT_LEFT   = b'\x28'   # inform peers a client left
+MSG_SRV_RATE_LIMIT    = b'\x29'   # propagate rate-limit to target server
+MSG_SRV_PEER_LIST     = b'\x2A'   # exchange known server IDs during handshake
 
 SECRET = b'PUBS1'
 
@@ -73,6 +97,28 @@ def start_listening(port):
     # socket.socket(), setsockopt, bind, listen
     # If port given but can't bind: exit 3
     # Print "listening on port N" to stderr
+    sock = socket.socket()
+    socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    if port is not None:
+        try: 
+            if port.isdigit():
+                lport = int(port)
+            else:
+                lport = socket.getservbyname(port)
+            sock.bind(('', lport))
+        except OSError:
+            print(f'pubsubserver: can\'t listen on port "{port}"', file=sys.stderr)
+            sys.exit(3)
+    else:
+        sock.bind(('', 0))
+    
+    sock.listen(128)
+    actual_port = sock.getsockname()[1]
+    print(f'pubsubserver: listening on port {actual_port}', file=sys.stderr)
+
+    return sock
+
 
 def connect_to_peer(host, port, arg_value, state):
     # Try connecting

@@ -4,6 +4,19 @@ import re
 import threading
 from sys import stdout,stdin,argv,exit
 
+# Protocol message type bytes (1 byte prefix for every message on the wire)
+MSG_HANDSHAKE_CLIENT  = b'\x01'  # client -> server: "I am a pubsubclient"
+MSG_HANDSHAKE_OK      = b'\x02'  # server -> client: "you are accepted"
+MSG_HANDSHAKE_DUP     = b'\x03'  # server -> client: "client ID duplicate"
+MSG_PUBLISH           = b'\x04'  # client -> server: publish a message
+MSG_SUBSCRIBE         = b'\x05'  # client -> server: subscribe to topic
+MSG_UNSUBSCRIBE       = b'\x06'  # client -> server: unsubscribe from topic
+MSG_INCOMING          = b'\x07'  # server -> client: incoming published message
+MSG_RATE_LIMIT        = b'\x08'  # server -> client: rate limit applied
+MSG_SERVER_QUIT       = b'\x09'  # server -> client: server shutting down
+MSG_SENDFILE          = b'\x0A'  # client -> server: send a file
+MSG_INCOMING_FILE     = b'\x0B'  # server -> client: incoming file
+
 SECRET = b'PUBS1'
 
 class Parameters:
