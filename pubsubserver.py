@@ -3,32 +3,34 @@ import socket
 import threading
 import re
 
-MSG_HANDSHAKE_CLIENT  = b'\x01'
-MSG_HANDSHAKE_OK      = b'\x02'
-MSG_HANDSHAKE_DUP     = b'\x03'
-MSG_PUBLISH           = b'\x04'
-MSG_SUBSCRIBE         = b'\x05'
-MSG_UNSUBSCRIBE       = b'\x06'
-MSG_INCOMING          = b'\x07'
-MSG_RATE_LIMIT        = b'\x08'
-MSG_SERVER_QUIT       = b'\x09'
-MSG_SENDFILE          = b'\x0A'
-MSG_INCOMING_FILE     = b'\x0B'
+CLIENT_HANDSHAKE = b'\x01'
+CLIENT_HANDSHAKE_OK = b'\x02'
+CLIENT_HANDSHAKE_DUP = b'\x03'
+CLIENT_PUBLISH = b'\x04'
+CLIENT_SUBSCRIBE = b'\x05'
+CLIENT_UNSUBSCRIBE = b'\x06'
+CLIENT_INCOMING = b'\x07'
+CLIENT_RATE_LIMIT = b'\x08'
+CLIENT_SERVER_QUIT = b'\x09'
+CLIENT_SENDFILE = b'\x0A'
+CLIENT_INCOMING_FILE = b'\x0B'
 
 # Server-to-server only messages
-MSG_SRV_HANDSHAKE     = b'\x20'   # peer intro: magic + server_id + known_server_ids
-MSG_SRV_HANDSHAKE_OK  = b'\x21'
-MSG_SRV_HANDSHAKE_DUP = b'\x22'   # duplicate server ID in federation
-MSG_SRV_HANDSHAKE_SELF= b'\x23'   # connected to self
-MSG_SRV_QUIT          = b'\x24'   # server shutting down
-MSG_SRV_PUBLISH       = b'\x25'   # federated publish (text)
-MSG_SRV_PUBLISH_FILE  = b'\x26'   # federated publish (file)
-MSG_SRV_CLIENT_JOINED = b'\x27'   # inform peers a new client joined
-MSG_SRV_CLIENT_LEFT   = b'\x28'   # inform peers a client left
-MSG_SRV_RATE_LIMIT    = b'\x29'   # propagate rate-limit to target server
-MSG_SRV_PEER_LIST     = b'\x2A'   # exchange known server IDs during handshake
+SRV_HANDSHAKE = b'\x0C'   # peer intro: magic + server_id + known_server_ids
+SRV_HANDSHAKE_OK = b'\x0D'
+SRV_HANDSHAKE_DUP = b'\x0E'   # duplicate server ID in federation
+SRV_HANDSHAKE_SELF = b'\x0F'   # connected to self
+SRV_QUIT = b'\x10'   # server shutting down
+SRV_PUBLISH  = b'\x11'   # federated publish (text)
+SRV_PUBLISH_FILE = b'\x12'   # federated publish (file)
+SRV_CLIENT_JOINED = b'\x13'   # inform peers a new client joined
+SRV_CLIENT_LEFT = b'\x14'   # inform peers a client left
+SRV_RATE_LIMIT = b'\x15'   # propagate rate-limit to target server
+SRV_PEER_LIST = b'\x16'   # exchange known server IDs during handshake
 
 SECRET = b'PUBS1'
+
+state_lock = threading.Lock()
 
 state = {
     'server_id': '...',
@@ -36,12 +38,55 @@ state = {
     'peers': {},            # {peer_id: {'sock': ..., 'thread': ...}}
     'rate_limits': {},      # {client_id: {topic: N_seconds}}
     'last_published': {},   # {client_id: {topic: timestamp}} for rate limiting
-    'lock': threading.Lock()
 }
 
 def usage():
     print('Usage: pubsubserver [--server [server]:port]... [--listenon port] serverid\n', file=sys.stderr)
     sys.exit(1)
+
+def send_frame(s, msg_type: bytes, *fields):
+    """Encode and send a framed message. fields may be str or bytes."""
+    payload = b'\x00'.join(
+        f.encode('utf-8') if isinstance(f, str) else f
+        for f in fields
+    )
+    header = msg_type + len(payload).to_bytes(4, byteorder='big')
+    try:
+        s.sendall(header + payload)
+    except OSError:
+        pass
+
+
+def recv_exactly(s, n):
+    buf = b''
+    while len(buf) < n:
+        try:
+            chunk = s.recv(n - len(buf))
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def recv_frame(s):
+    """Returns (msg_type_byte, list_of_field_bytes) or (None, None)."""
+    header = recv_exactly(s, 5)
+    if header is None:
+        return None, None
+    msg_type = header[0:1]
+    length = int.from_bytes(header[1:5], byteorder='big')
+    if length == 0:
+        return msg_type, []
+    payload = recv_exactly(s, length)
+    if payload is None:
+        return None, None
+    return msg_type, payload.split(b'\x00')
+
+
+def decode(b: bytes) -> str:
+    return b.decode('utf-8')
 
 def parse(argv):
     """
@@ -98,7 +143,7 @@ def start_listening(port):
     # If port given but can't bind: exit 3
     # Print "listening on port N" to stderr
     sock = socket.socket()
-    socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     if port is not None:
         try: 
@@ -125,16 +170,134 @@ def connect_to_peer(host, port, arg_value, state):
     # Handshake to verify it's your server
     # Check: not self, not already connected, no duplicate IDs
     # Print success/failure messages
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+    except OSError:
+        print(f'pubsubserver: unable to connect to "{arg_value}"',
+              file=sys.stderr, flush=True)
+        return
+    
+    send_frame(sock, SRV_HANDSHAKE, SECRET, state['server_id'])
 
-def accept_connections_thread(listen_sock, state):
+    sock.settimeout(1.0)
+    msg_type, fields = recv_frame(sock)
+    sock.settimeout(None)
+
+    if msg_type != SRV_HANDSHAKE_OK or not fields or fields[0] != SECRET:
+        print(f'pubsubserver: server at "{arg_value}" is not valid',
+              file=sys.stderr, flush=True)
+        sock.close()
+        return
+
+
+
+
+def accept_connections_thread(sock, state):
     # Loop: sock, addr = listen_sock.accept()
     # Spawn new thread: handle_connection(sock, addr, state)
+    while True:
+        try:
+            conn, addr = sock.accept()
+        except OSError:
+            return
+
+        threading.Thread(
+            target=handle_connection,
+            args=(conn, addr, state),
+            daemon=True
+        ).start()
 
 def handle_connection(sock, addr, state):
     # Within 1 second, determine: client or peer server?
     # If client: check unique ID, add to state, start client thread
     # If peer: do peer handshake
     # If unknown: close within 1 second
+    try:
+        sock.settimeout(1.0)
+        msg_type, fields = recv_frame(sock)
+        sock.settimeout(None)
+
+        if msg_type is None:
+                print('pubsubserver: Connection with unknown client aborted', file=sys.stderr, flush=True)
+                sock.close()
+                return
+        
+        if msg_type == CLIENT_HANDSHAKE:
+            if len(fields) < 2:
+                print('pubsubserver: Connection with unknown client aborted', file=sys.stderr, flush=True)
+                sock.close()
+                return
+
+            secret = fields[0]
+            client_id = decode(fields[1])
+
+            if secret != SECRET:
+                sock.close()
+                return
+            
+            with state_lock:
+                if client_id in state['clients']:
+                    send_frame(sock, CLIENT_HANDSHAKE_DUP)
+                    sock.close()
+                    return
+
+                state['clients'][client_id] = {
+                    'sock': sock,
+                    'subs': []
+                }
+
+            send_frame(sock, CLIENT_HANDSHAKE_OK, SECRET)
+
+            threading.Thread(
+                target=handle_client_thread,
+                args=(sock, client_id, state),
+                daemon=True
+            ).start()
+            return
+        
+        elif msg_type == SRV_HANDSHAKE:
+            if len(fields) < 2:
+                sock.close()
+                return
+
+            secret = fields[0]
+            peer_id = decode(fields[1])
+
+            if secret != SECRET:
+                sock.close()
+                return
+            
+            if peer_id == state['server_id']:
+                sock.close()
+                return
+            
+
+            with state_lock:
+                if peer_id in state['peers']:
+                    sock.close()
+                    return
+
+                state['peers'][peer_id] = {
+                    'sock': sock
+                }
+
+            # send OK back (you should define this)
+            send_frame(sock, SRV_HANDSHAKE_OK, SECRET)
+
+            threading.Thread(
+                target=handle_peer_thread,
+                args=(sock, peer_id, state),
+                daemon=True
+            ).start()
+            return
+
+        else:
+            sock.close()
+
+    except OSError:
+        sock.close()
+
+
 
 def handle_client_thread(sock, client_id, state):
     # Loop: receive message from client

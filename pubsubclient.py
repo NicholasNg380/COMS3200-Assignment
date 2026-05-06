@@ -5,17 +5,17 @@ import threading
 from sys import stdout,stdin,argv,exit
 
 # Protocol message type bytes (1 byte prefix for every message on the wire)
-MSG_HANDSHAKE_CLIENT  = b'\x01'  # client -> server: "I am a pubsubclient"
-MSG_HANDSHAKE_OK      = b'\x02'  # server -> client: "you are accepted"
-MSG_HANDSHAKE_DUP     = b'\x03'  # server -> client: "client ID duplicate"
-MSG_PUBLISH           = b'\x04'  # client -> server: publish a message
-MSG_SUBSCRIBE         = b'\x05'  # client -> server: subscribe to topic
-MSG_UNSUBSCRIBE       = b'\x06'  # client -> server: unsubscribe from topic
-MSG_INCOMING          = b'\x07'  # server -> client: incoming published message
-MSG_RATE_LIMIT        = b'\x08'  # server -> client: rate limit applied
-MSG_SERVER_QUIT       = b'\x09'  # server -> client: server shutting down
-MSG_SENDFILE          = b'\x0A'  # client -> server: send a file
-MSG_INCOMING_FILE     = b'\x0B'  # server -> client: incoming file
+CLIENT_HANDSHAKE = b'\x01' # client -> server: "I am a pubsubclient"
+CLIENT_HANDSHAKE_OK = b'\x02' # server -> client: "you are accepted"
+CLIENT_HANDSHAKE_DUP = b'\x03' # server -> client: "client ID duplicate"
+CLIENT_PUBLISH = b'\x04' # client -> server: publish a message
+CLIENT_SUBSCRIBE = b'\x05' # client -> server: subscribe to topic
+CLIENT_UNSUBSCRIBE = b'\x06' # client -> server: unsubscribe from topic
+CLIENT_INCOMING = b'\x07' # server -> client: incoming published message
+CLIENT_RATE_LIMIT = b'\x08' # server -> client: rate limit applied
+CLIENT_SERVER_QUIT = b'\x09' # server -> client: server shutting down
+CLIENT_SENDFILE = b'\x0A' # client -> server: send a file
+CLIENT_INCOMING_FILE = b'\x0B' # server -> client: incoming file
 
 SECRET = b'PUBS1'
 
@@ -27,7 +27,7 @@ class Parameters:
         self.message = None
 
 def usage():
-    print("Usage: pubsubclient [--topic topic] [server]:port clientid [message]\n", file=sys.stderr)
+    print("Usage: pubsubclient [--topic topic] [server]:port clientid [message]", file=sys.stderr)
     sys.exit(1)
 
 state = {
@@ -162,15 +162,15 @@ def handshake_client(sock, client_id):
 
         # Send: MAGIC + null + clientid
     payload = SECRET + b'\x00' + client_id.encode('utf-8')
-    header = MSG_HANDSHAKE_CLIENT + struct.pack('>I', len(payload))
+    header = CLIENT_HANDSHAKE + len(payload).to_bytes(4, 'big')
     try:
-        s.sendall(header + payload)
+        sock.sendall(header + payload)
     except OSError:
         eprint(f'pubsubclient: unable to connect to "{display}"')
         sys.exit(7)
 
     # Give server 1 second to respond
-    s.settimeout(1.0)
+    sock.settimeout(1.0)
     try:
         msg_type, fields = recv_frame(s)
     except socket.timeout:
