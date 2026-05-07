@@ -133,10 +133,25 @@ def parse(argv):
 
     return server_list, listenport, serverid
 
-def validate_server_id(sid):  # Same rules as client ID
+def serverid_check(sid): 
     if not (2 <= len(sid) <= 32) or not re.fullmatch(r'[A-Za-z0-9]+', sid):
         print(f'pubsubserver: bad server ID "{sid}"', file=sys.stderr)
         sys.exit(2)
+
+def clientid_check(cid):
+    if not re.fullmatch(r'[A-Za-z0-9]{2,32}', cid):
+        print(f'pubsubclient: bad client ID "{cid}"', file=sys.stderr)
+        sys.exit(4)
+
+def topic_check(topic, exit=True):
+    if re.fullmatch(r'[A-Za-z][A-Za-z0-9 /]*', topic):
+        return True
+    if exit:
+        print(f'pubsubclient: invalid topic string "{topic}"', file=sys.stderr)
+        sys.exit(5)
+    else:
+        print(f'pubsubclient: invalid topic string "{topic}"', file=sys.stderr)
+        return False
 
 def validate_filter(filter_str):
     """

@@ -178,7 +178,7 @@ def send_layer(sock, type, *information):
 
 
 def handshake(sock, cid, svr_port):
-    # Header Format [message type: 1 byte][payload length: 4 byte]
+    # Header Format [message type: 1 byte][payload length: 4 byte][data]
     data = SECRET + b'\x00' + cid.encode('utf-8')
     header = CLIENT_HANDSHAKE + len(data).to_bytes(4, 'big')
     try:
