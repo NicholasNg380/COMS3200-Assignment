@@ -1,134 +1,121 @@
-from socket import *
+"""! @file pubsubclient.py
+"""
+
+import socket
 import sys
 import re
 import threading
+import time
 from sys import stdout,stdin,argv,exit
 
-# Protocol message type bytes (1 byte prefix for every message on the wire)
-CLIENT_HANDSHAKE = b'\x01' # client -> server: "I am a pubsubclient"
-CLIENT_HANDSHAKE_OK = b'\x02' # server -> client: "you are accepted"
-CLIENT_HANDSHAKE_DUP = b'\x03' # server -> client: "client ID duplicate"
-CLIENT_PUBLISH = b'\x04' # client -> server: publish a message
-CLIENT_SUBSCRIBE = b'\x05' # client -> server: subscribe to topic
-CLIENT_UNSUBSCRIBE = b'\x06' # client -> server: unsubscribe from topic
-CLIENT_INCOMING = b'\x07' # server -> client: incoming published message
-CLIENT_RATE_LIMIT = b'\x08' # server -> client: rate limit applied
-CLIENT_SERVER_QUIT = b'\x09' # server -> client: server shutting down
-CLIENT_SENDFILE = b'\x0A' # client -> server: send a file
-CLIENT_INCOMING_FILE = b'\x0B' # server -> client: incoming file
+# Client message types for sending and recieving
+CLIENT_HANDSHAKE = b'\x01' 
+CLIENT_HANDSHAKE_OK = b'\x02' 
+CLIENT_HANDSHAKE_DUP = b'\x03' 
+CLIENT_MSG_PUBLISH = b'\x04' 
+CLIENT_SUBSCRIBE = b'\x05' 
+CLIENT_UNSUBSCRIBE = b'\x06'
+CLIENT_INCOMING = b'\x07' 
+CLIENT_RATE_LIMIT = b'\x08' 
+CLIENT_SERVER_QUIT = b'\x09' 
+CLIENT_SENDFILE = b'\x0A' 
+CLIENT_INCOMING_FILE = b'\x0B'
 
+# Key to verify server
 SECRET = b'PUBS1'
 
+state_lock = threading.Lock()
+
+# initital parameters from argument line
 class Parameters:
     def __init__(self):
         self.topic = None
-        self.server_port = None
-        self.clientid = None
-        self.message = None
+        self.sp = None
+        self.cid = None
+        self.msg = None
 
+class State:
+    def __init__(self):
+        self.d_topic = None
+        self.sub = []      # list of (topic, filter_str)
+        self.limits = {}             # {topic: N_seconds}
+        self.last_sent = {}          # {topic: timestamp}
+        self.files_received = 0
+
+# Usage error
 def usage():
     print("Usage: pubsubclient [--topic topic] [server]:port clientid [message]", file=sys.stderr)
     sys.exit(1)
-
-state = {
-    'default_topic': None,       # Set by --topic or /topic
-    'subscriptions': [],         # List of (topic, filter) tuples
-    'limits': [],                # Rate limits applied by server
-    'files_received': 0,         # Counter for received file naming
-}
 
 def parse(argv):
     params = Parameters()
     args = argv[1:]
     
-    # Pull --topic if present
     if args and args[0] == '--topic':
         if len(args) < 2:
             usage()
         params.topic = args[1]
         args = args[2:]
-    
-    # Check for unexpected option args
-    # [server]:port must contain ':'
+
     if not args or ':' not in args[0]:
         usage()
     
-    params.server_port = args[0]
+    colon = args[0].index(':')
+    port_str = args[0][colon + 1:]
+
+    if port_str == '':
+        usage()
+    
+    params.sp = args[0]
     args = args[1:]
     
     if not args:
         usage()
-    params.clientid = args[0]
+
+    params.cid = args[0]
     args = args[1:]
     
     if args:
-        params.message = args[0]
+        params.msg = args[0]
         args = args[1:]
     
-    if args:  # leftover args
+    if args:
         usage()
     
-    if params.message and not params.topic:
+    if params.msg and not params.topic:
         usage()
     
     return params
 
-def validate_clientid(cid):
-    if not (2 <= len(cid) <= 32) or not re.fullmatch(r'[A-Za-z0-9]+', cid):
+def clientid_check(cid):
+    if not re.fullmatch(r'[A-Za-z0-9]{2,32}', cid):
         print(f'pubsubclient: bad client ID "{cid}"', file=sys.stderr)
         sys.exit(4)
 
-
-def validate_topic(topic, exit_on_fail=True):
-    """Returns True if valid, or prints error and exits/returns False."""
+def topic_check(topic, exit=True):
     if re.fullmatch(r'[A-Za-z][A-Za-z0-9 /]*', topic):
         return True
-    if exit_on_fail:
+    if exit:
         print(f'pubsubclient: invalid topic string "{topic}"', file=sys.stderr)
         sys.exit(5)
     else:
         print(f'pubsubclient: invalid topic string "{topic}"', file=sys.stderr)
         return False
-
-
-def validate_message(msg, exit_on_fail=True):
+    
+def message_check(msg, exit):
     if msg.isprintable():
         return True
-    if exit_on_fail:
-        print('pubsubclient: messages must only contain printable characters')
+    if exit:
+        print('pubsubclient: messages must only contain printable characters', file=sys.stderr)
         sys.exit(6)
     else:
-        print('pubsubclient: messages must only contain printable characters')
+        print('pubsubclient: messages must only contain printable characters', file=sys.stderr)
         return False
 
-
-def validate_filter(filter_str):
-    """
-    A filter is 'operator value' where operator in {<,<=,>,>=,==,!=}
-    and value is a numeric (int or float).
-    Returns (operator, float_value) or None if invalid.
-    """
-    if filter_str is None:
-        return True  # no filter = valid
-    m = re.fullmatch(r'(<=|>=|==|!=|<|>)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)', filter_str.strip())
-    if not m:
-        return None
-    op = m.group(1)
-    try:
-        val = float(m.group(2))
-    except ValueError:
-        return None
-    return (op, val)
-
-def resolve_server_port(server_port_str):
-    """
-    Split 'server:port' into (host, port_int, display_str).
-    display_str uses 'localhost' if no host was given.
-    """
-    colon = server_port_str.index(':')
-    host = server_port_str[:colon] or 'localhost'
-    port_str = server_port_str[colon + 1:]
-    # Resolve service name
+def connect_server(srv_port):
+    colon = srv_port.index(':')
+    host = srv_port[:colon] or 'localhost'
+    port_str = srv_port[colon + 1:]
     try:
         if port_str.isdigit():
             port = int(port_str)
@@ -136,67 +123,116 @@ def resolve_server_port(server_port_str):
             port = socket.getservbyname(port_str)
     except (OSError, ValueError):
         port = None
-    return host, port
 
-def connect_to_server(host, port):
-    """
-    Connect to the server.  Returns (socket, display_str).
-    Exits with status 7 if unable to connect.
-    """
-    display = f'{host}:{port}'
     if port is None:
-        print(f'pubsubclient: unable to connect to "{display}"', file=sys.stderr)
+        print(f'pubsubclient: unable to connect to "{host}:{port_str}"', file=sys.stderr)
         sys.exit(7)
     try:
-        s = socket.create_connection((host, port), timeout=5)
-        s.settimeout(None)  # back to blocking after connect
-        return s, display
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.settimeout(None)
+        return sock
     except OSError:
-        print(f'pubsubclient: unable to connect to "{display}"', file=sys.stderr)
+        print(f'pubsubclient: unable to connect to "{host}:{port_str}"', file=sys.stderr)
         sys.exit(7)
-        
-def handshake_client(sock, client_id):
-    # Send your custom protocol "hello" to server
-    # Read response - is it your server? Is ID unique?
-    # Exit with code 8 or 9 if not
 
-        # Send: MAGIC + null + clientid
-    payload = SECRET + b'\x00' + client_id.encode('utf-8')
-    header = CLIENT_HANDSHAKE + len(payload).to_bytes(4, 'big')
+def segment_read(sock, size):
+    buffer = b''
+    while len(buffer) < size:
+        try:
+            data = sock.recv(size - len(buffer))
+        except OSError:
+            return None
+        if not data:
+            return None
+        buffer += data
+    return buffer
+
+def recv_layer(sock):
+    header = segment_read(sock, 5)
+    if header is None:
+        return None, None
+    type = header[0:1]
+    length = int.from_bytes(header[1:5], byteorder='big')
+    if length == 0:
+        return type, []
+    data = segment_read(sock, length)
+    if data is None:
+        return None, None
+    return type, data.split(b'\x00')
+
+def send_layer(sock, type, *information):
+    parts = []
+
+    for info in information:
+        if isinstance(info, str):
+            parts.append(info.encode('utf-8'))
+        else:
+            parts.append(info)
+
+    data = b'\x00'.join(parts)
+    header = type + len(data).to_bytes(4, 'big')
     try:
-        sock.sendall(header + payload)
+        sock.sendall(header + data)
     except OSError:
-        eprint(f'pubsubclient: unable to connect to "{display}"')
+        pass
+
+
+def handshake(sock, cid, svr_port):
+    # Header Format [message type: 1 byte][payload length: 4 byte]
+    data = SECRET + b'\x00' + cid.encode('utf-8')
+    header = CLIENT_HANDSHAKE + len(data).to_bytes(4, 'big')
+    try:
+        sock.sendall(header + data)
+    except OSError:
+        print(f'pubsubclient: unable to connect to "{svr_port}"', file=sys.stderr)
         sys.exit(7)
 
-    # Give server 1 second to respond
     sock.settimeout(1.0)
     try:
-        msg_type, fields = recv_frame(s)
+        msg_type, data = recv_layer(sock)
     except socket.timeout:
-        msg_type, fields = None, None
+        msg_type, data = None, None
     finally:
-        s.settimeout(None)
+        sock.settimeout(None)
 
     if msg_type is None:
-        eprint(f'pubsubclient: server at "{display}" is not a valid server')
+        print(f'pubsubclient: server at "{svr_port}" is not a valid server', file=sys.stderr)
         sys.exit(8)
 
-    if msg_type == MSG_HANDSHAKE_DUP:
-        eprint(f'pubsubclient: client ID "{clientid}" is not unique')
+    if not data or data[0] != SECRET:
+        print(f'pubsubclient: server at "{svr_port}" is not a valid server', file=sys.stderr)
+        sys.exit(8)
+
+    if msg_type == CLIENT_HANDSHAKE_DUP:
+        print(f'pubsubclient: client ID "{cid}" is not unique', file=sys.stderr) 
         sys.exit(9)
-
-    if msg_type != MSG_HANDSHAKE_OK:
-        eprint(f'pubsubclient: server at "{display}" is not a valid server')
+    elif msg_type != CLIENT_HANDSHAKE_OK:
+        print(f'pubsubclient: server at "{svr_port}" is not a valid server', file=sys.stderr)
         sys.exit(8)
 
-    # Verify magic in response payload
-    if not fields or fields[0] != MAGIC:
-        eprint(f'pubsubclient: server at "{display}" is not a valid server')
-        sys.exit(8)
 
 def main():
     params = parse(sys.argv)
+
+    clientid_check(params.cid)
+
+    if params.topic is not None:
+            topic_check(params.topic, True)
+
+    if params.msg is not None:
+            message_check(params.msg, True)
+
+    conn = connect_server(params.sp)
+    sock = conn
+
+    handshake(sock, params.cid, params.sp)
+
+    if params.msg:
+        send_layer(sock, CLIENT_MSG_PUBLISH, params.topic, params.msg)
+        time.sleep(0.1)
+        sys.exit(0)
+
+
 
 
 if __name__ == "__main__":
