@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-CLIENT = ["python3", "new_pubsubclient.py"]
+CLIENT = ["python3", "pubsubclient.py"]
 PASS = 0
 FAIL = 0
 

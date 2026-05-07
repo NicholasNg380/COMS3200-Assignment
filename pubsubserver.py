@@ -7,7 +7,7 @@ import threading
 import re
 import time
 
-# Client message types for sending and recieving
+# Client message types for sending and receiving
 CLIENT_HANDSHAKE = b'\x01'
 CLIENT_HANDSHAKE_OK = b'\x02'
 CLIENT_HANDSHAKE_DUP = b'\x03'
@@ -20,7 +20,7 @@ CLIENT_SERVER_QUIT = b'\x09'
 CLIENT_SENDFILE = b'\x0A'
 CLIENT_INCOMING_FILE = b'\x0B'
 
-# Server message types for sending and recieving
+# Server message types for sending and receiving
 SERVER_HANDSHAKE = b'\x0C'
 SERVER_HANDSHAKE_OK = b'\x0D'
 SERVER_HANDSHAKE_DUP = b'\x0E'
@@ -57,7 +57,7 @@ class ClientConn:
     def __init__(self, cid, sock):
         self.cid = cid
         self.sock = sock
-        self.subscriptions = []      # list of (topic, filter_str)
+        self.sub = []      # list of (topic, filter_str)
 
 class PeerConn:
     def __init__(self, pid, sock):
@@ -98,7 +98,6 @@ def parse(argv):
         else:
             usage()
 
-    # remaining must be exactly: serverid
     if len(args) != 1:
         usage()
     sid = args[0]
@@ -259,14 +258,14 @@ def server_connect(server, state: State):
     t = threading.Thread(target=peer_functions, args=(pid, conn, state), daemon=True)
     t.start()
 
-def peer_functions(pid, sock, state):
+def peer_functions(pid, sock, state: State):
     while True:
         type, data = recv_layer(sock)
         if type is None:
             with state_lock:
                 if pid in state.peers:
                     del state.peers[pid]
-                    state.known_sids.discard(pid)
+                    state.servers.discard(pid)
             print(f'pubsubserver: Peer server "{pid}" disconnected', file=sys.stderr, flush=True)
             return
         
@@ -296,7 +295,7 @@ def peer_quit(pid, state: State):
                 remove.append(cid)
         for cid in remove:
             del state.fed_clients[cid]
-    print(f'pubsubserver: Peer server "{pid}" shutting down', flush=True)
+    print(f'pubsubserver: Peer server "{pid}" shutting down', file=sys.stdout, flush=True)
 
 def peer_publish(data, state: State):
     server_id   = data[0].decode('utf-8')
@@ -309,7 +308,7 @@ def peer_publish(data, state: State):
         peers = list(state.peers.values())
 
     for client in clients:
-        if filter_match(client.subscriptions, topic, message):
+        if filter_match(client.sub, topic, message):
             send_layer(client.sock, CLIENT_INCOMING, server_id, client_id, topic, message)
 
     for peer in peers:
@@ -320,7 +319,7 @@ def peer_client_joined(data, state: State):
     sid = data[0].decode()
     cid = data[1].decode()
     with state_lock:
-        state.fed_clientss[cid] = sid
+        state.fed_clients[cid] = sid
 
 def peer_client_left(data, state: State):
     sid = data[0].decode()
@@ -459,8 +458,8 @@ def client_functions(cid, conn, state):
                 if cid in state.clients:
                     del state.clients[cid]
             for peer in list(state.peers.values()):
-                send_layer(peer.sock, SERVER_CLIENT_LEFT, cid)
-            print(f'pubsubserver: Client "{cid}" has disconnected', flush=True)
+                send_layer(peer.sock, SERVER_CLIENT_LEFT, state.sid, cid)
+            print(f'pubsubserver: Client "{cid}" has disconnected', file=sys.stdout, flush=True)
             return
         
         if msg_type == CLIENT_PUBLISH:
@@ -480,8 +479,8 @@ def client_functions(cid, conn, state):
                 if cid in state.clients:
                     del state.clients[cid]
             for peer in list(state.peers.values()):
-                send_layer(peer.sock, SERVER_CLIENT_LEFT, cid)
-            print(f'pubsubserver: Client "{cid}" has disconnected', flush=True)
+                send_layer(peer.sock, SERVER_CLIENT_LEFT, state.sid, cid)
+            print(f'pubsubserver: Client "{cid}" has disconnected', file=sys.stdout, flush=True)
             return
         
 def client_publish(cid, data, state: State):
@@ -507,7 +506,7 @@ def client_publish(cid, data, state: State):
     
     seen = set()
     for client in clients:
-        if filter_match(client.subscriptions, topic, message):
+        if filter_match(client.sub, topic, message):
             if client.cid not in seen:
                 seen.add(client.cid)
                 send_layer(client.sock, CLIENT_INCOMING, state.sid, cid, topic, message)
@@ -522,7 +521,7 @@ def client_subscribe(cid, data, state:State):
     with state_lock:
         client = state.clients.get(cid)
         if client:
-            client.subscriptions.append((topic, filter_str))
+            client.sub.append((topic, filter_str))
 
 def client_unsubscribe(cid, data, state: State):
     topic = data[0].decode('utf-8')
@@ -530,7 +529,7 @@ def client_unsubscribe(cid, data, state: State):
     with state_lock:
         client = state.clients.get(cid)
         if client:
-            client.subscriptions.remove((topic, filter_str))
+            client.sub.remove((topic, filter_str))
 
 def client_sendfile(cid, data, state: State):
     topic    = data[0].decode('utf-8')
@@ -542,7 +541,7 @@ def client_sendfile(cid, data, state: State):
     
     seen = set()
     for client in clients:
-        if any(t == topic and f is None for t, f in client.subscriptions):
+        if any(t == topic and f is None for t, f in client.sub):
             if client.cid not in seen:
                 seen.add(client.cid)
                 send_layer(client.sock, CLIENT_INCOMING_FILE, state.sid, cid, topic, filename, content)
@@ -550,13 +549,13 @@ def client_sendfile(cid, data, state: State):
     for peer in list(state.peers.values()):
         send_layer(peer.sock, SERVER_PUBLISH_FILE, state.sid, cid, topic, filename, content)
 
-def filter_match(subscriptions, topic, message):
+def filter_match(sub, topic, message):
     match = False
-    for top, filter in subscriptions:
+    for top, filter in sub:
         if top != topic:
             continue
         if filter is None:
-            matched = True
+            match = True
             break
         try:
             val = float(message.strip())
@@ -565,18 +564,18 @@ def filter_match(subscriptions, topic, message):
         op, num = filter.split(None, 1)
         num = float(num)
         if op == '<' and val < num: 
-            matched = True
+            match = True
         elif op == '<=' and val <= num: 
-            matched = True
+            match = True
         elif op == '>'  and val >  num: 
-            matched = True
+            match = True
         elif op == '>=' and val >= num: 
-            matched = True
+            match = True
         elif op == '==' and val == num: 
-            matched = True
+            match = True
         elif op == '!=' and val != num: 
-            matched = True
-        if matched:
+            match = True
+        if match:
             break
     return match
 
@@ -687,7 +686,7 @@ def quit(state: State):
 
 def listclients(arg, state: State):
     if arg and arg[0] == '--all':
-        if len > 1:
+        if len(arg) > 1:
             print('pubsubserver: unknown argument(s) - usage: /listclients [--all]', file=sys.stderr, flush=True)
             return
         with state_lock:
@@ -712,7 +711,7 @@ def listclients(arg, state: State):
 
 def listpeers(arg, state: State):
     if arg and arg[0] == '--all':
-        if len > 1:
+        if len(arg) > 1:
             print('pubsubserver: unknown argument(s) - usage: /listpeers [--all]', file=sys.stderr, flush=True)
             return
         with state_lock:
@@ -737,10 +736,11 @@ def peer(arg, state: State):
     if len(arg) != 1:
         print('pubsubserver: unknown argument(s) - usage: /peer [server]:port', file=sys.stderr, flush=True)
         return
-    if ':' not in arg or arg[arg.index(':') + 1:] == '':
+    server = arg[0]
+    if ':' not in server or server[server.index(':') + 1:] == '':
         print('pubsubserver: unknown argument(s) - usage: /peer [server]:port', file=sys.stderr, flush=True)
         return
-    server_connect(arg, state)
+    server_connect(server, state)
 
 def limit(args, state: State):
     if len(args) != 3:
@@ -750,29 +750,31 @@ def limit(args, state: State):
     cid, topic, N = args
 
     with state_lock:
-        if not clientid_check(cid) or cid not in state.clients:
-            print(f'pubsubserver: Client "{cid}" is unknown', file=sys.stderr, flush=True)
-            return
+        exists = cid in state.clients
+    
+    if not clientid_check(cid) or not exists:
+        print(f'pubsubserver: Client "{cid}" is unknown', file=sys.stderr, flush=True)
+        return
         
-        if not topic_check(topic):
-            print(f'pubsubserver: Topic "{topic}" is not valid', file=sys.stderr, flush=True)
-            return
+    if not topic_check(topic):
+        print(f'pubsubserver: Topic "{topic}" is not valid', file=sys.stderr, flush=True)
+        return
         
-        if not N.isdigit() or not (0 <= int(N) <= 3600):
-            print(f'pubsubserver: Rate limit must be 0 to 3600 seconds inclusive', file=sys.stderr, flush=True)
-            return
+    if not N.isdigit() or not (0 <= int(N) <= 3600):
+        print(f'pubsubserver: Rate limit must be 0 to 3600 seconds inclusive', file=sys.stderr, flush=True)
+        return
         
-        limit = int(N)
+    limit = int(N)
 
-        with state_lock:
-            state.limits.setdefault(cid, {})[topic] = limit
-            client_conn = state.clients.get(cid)
+    with state_lock:
+        state.limits.setdefault(cid, {})[topic] = limit
+        client_conn = state.clients.get(cid)
 
-        if client_conn:
-            send_layer(client_conn, CLIENT_RATE_LIMIT, topic, str(limit))
+    if client_conn:
+        send_layer(client_conn.sock, CLIENT_RATE_LIMIT, topic, str(limit))
 
-        for peer in list(state.peers.values):
-            send_layer(peer.sock, SERVER_RATE_LIMIT, cid, topic, str(limit))
+    for peer in list(state.peers.values()):
+        send_layer(peer.sock, SERVER_RATE_LIMIT, cid, topic, str(limit))
 
 def main():
     params = parse(sys.argv)
@@ -805,8 +807,8 @@ def main():
     for server in params.servers:
         server_connect(server, state)
 
-    accept = threading.Thread(target=accept, args=(sock, state), daemon=True)
-    accept.start()
+    accept_t = threading.Thread(target=accept, args=(sock, state))
+    accept_t.start()
 
     stdin(state)
 
